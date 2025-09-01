@@ -1,5 +1,4 @@
 import discord
-from discord import app_commands
 import os
 import json
 import base64
@@ -14,10 +13,17 @@ load_dotenv()
 
 BOT_API_KEY = os.getenv("BOT_API_KEY")
 AI_API_KEY = os.getenv("AI_API_KEY")
-ALLOWED_CHANNELS = os.getenv("ALLOWED_CHANNELS")
-OVERRIDE_USERS = os.getenv("OVERRIDE_USERS")
-ALLOWED_CHANNELS = json.loads(os.getenv("ALLOWED_CHANNELS"))
-OVERRIDE_USERS = json.loads(os.getenv("OVERRIDE_USERS"))
+
+# Load and convert ALLOWED_CHANNELS to have integer user IDs
+allowed_channels_raw = json.loads(os.getenv("ALLOWED_CHANNELS", "{}"))
+ALLOWED_CHANNELS = {}
+for channel_id, user_list in allowed_channels_raw.items():
+    if user_list is not None:
+        ALLOWED_CHANNELS[channel_id] = [int(user_id) for user_id in user_list]
+    else:
+        ALLOWED_CHANNELS[channel_id] = None
+
+OVERRIDE_USERS = [int(user_id) for user_id in json.loads(os.getenv("OVERRIDE_USERS", "[]"))]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -29,40 +35,19 @@ claudeClient = AsyncAnthropic(
     api_key = os.getenv("ANTHROPIC_API_KEY")
 )
 
-class MyClient(discord.Client):
-    def __init__(self, *, intents: discord.Intents):
-        super().__init__(intents=intents)
-        # A CommandTree is a special type that holds all the application command
-        # state required to make it work. This is a separate class because it
-        # allows all the extra state to be opt-in.
-        # Whenever you want to work with application commands, your tree is used
-        # to store and work with them.
-        # Note: When using commands.Bot instead of discord.Client, the bot will
-        # maintain its own tree instead.
-        self.tree = app_commands.CommandTree(self)
-
-    # In this basic example, we just synchronize the app commands to one guild.
-    # Instead of specifying a guild to every command, we copy over our global commands instead.
-    # By doing so, we don't have to wait up to an hour until they are shown to the end-user.
-    async def setup_hook(self):
-        # Sync commands globally for user installs to work in DMs
-        # DO NOT SYNC THE SAME COMMAND GLOBALLY AND COPIED TO A GUILD
-        await self.tree.sync()
+# Dictionary to store conversation histories per user
+user_histories = {}
 
 intents = discord.Intents.default()
-client = MyClient(intents=intents)
+intents.message_content = True
+intents.messages = True
+client = discord.Client(intents=intents)
 
-def channel_check(interaction: discord.Interaction) -> bool:
-    if interaction.channel_id in ALLOWED_CHANNELS or interaction.user.id in OVERRIDE_USERS:
-        return True
-    else:
-        return False
-    
-async def execute_tool(tool_name, tool_input):
+async def execute_tool(tool_name, tool_input, user_id):
     try:
         if hasattr(tools, tool_name):
             tool_function = getattr(tools, tool_name)
-            result = tool_function(tool_input)
+            result = tool_function(tool_input, user_id)
             logger.info(f"Got result from tool: {result}")
             return result
         else:
@@ -72,7 +57,7 @@ async def execute_tool(tool_name, tool_input):
         logger.error(f"Error calling tool: {e}")
         return f"Error calling tool: {e}"
     
-async def send_to_ai(conversationToBot: list, interaction: discord.Interaction) -> str:
+async def send_to_ai(conversationToBot: list, message_to_edit: discord.Message, user_id: int) -> str:
     try:
          while True:
             claudeResponse = await claudeClient.messages.create(
@@ -93,6 +78,7 @@ async def send_to_ai(conversationToBot: list, interaction: discord.Interaction) 
 
             if claudeResponse.stop_reason == "tool_use":
                 logger.info("Detected tool call(s)")
+                await message_to_edit.edit(content="Processing tool calls")
                 conversationToBot.append({"role": "assistant", "content": claudeResponse.content})
 
                 tool_content = []
@@ -102,58 +88,61 @@ async def send_to_ai(conversationToBot: list, interaction: discord.Interaction) 
                         logger.debug(f"not tool, skipping")
                         continue
                     logger.info(f"Found tool: {content.name}")
-                    tool_result = await execute_tool(content.name, content.input)
-                    tool_content.append({"type": "tool_result", 
+                    tool_result = await execute_tool(content.name, content.input, user_id)
+                    tool_content.append({"type": "tool_result",
                                          "tool_use_id": content.id,
                                          "content": tool_result})
-                    
+
                 conversationToBot.append({"role": "user",
                                           "content": tool_content})
-                
+
             else:
                 # No tool calls, send final message
                 for content in claudeResponse.content:
                     if content.type == "text":
                         final_text = content.text
-                logger.info(f"Generated: \n{final_text}")         
+                logger.info(f"Generated: \n{final_text}")
+                await message_to_edit.edit(content=final_text)
+                # Append assistant's response to history
+                conversationToBot.append({"role": "assistant", "content": claudeResponse.content})
                 return final_text
-            
+
     except Exception as e:
         logger.error(f"Error: {e}")
+        await message_to_edit.edit(content=f"Error: {e}")
 
-async def handle_chat_request(interaction: discord.Interaction, newUserMessage: discord.message, continueConversation = False) -> str:
+async def handle_chat_request(conversation_history: list, newUserMessage: discord.Message, message_to_edit: discord.Message, user_id: int):
     logger.info(f"Received message '{newUserMessage.content}'")
 
-    conversationToBot = []
     try:
         if newUserMessage.attachments:
             for attachment in newUserMessage.attachments:
                 if "image" in attachment.content_type:
-                    logger.info("Found image attchment in message")
+                    logger.info("Found image attachment in message")
                     image_data = await attachment.read()
                     image = Image.open(io.BytesIO(image_data))
-                    
-                    # Check if image is larger than 1000x1000 pixels and resize if needed
+
+                    # Check if image is larger than 800x800 pixels and resize if needed
                     width, height = image.size
-                    if width > 1000 or height > 1000:
-                        logger.info(f"Image size {width}x{height} exceeds 1000x1000, resizing...")
+                    if width > 800 or height > 800:
+                        logger.info(f"Image size {width}x{height} exceeds 800x800, resizing...")
                         # Calculate new dimensions while maintaining aspect ratio
                         if width > height:
-                            new_width = 1000
-                            new_height = int((height * 1000) / width)
+                            new_width = 800
+                            new_height = int((height * 800) / width)
                         else:
-                            new_height = 1000
-                            new_width = int((width * 1000) / height)
-                        
+                            new_height = 800
+                            new_width = int((width * 800) / height)
+
                         # Resize the image
                         image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                         logger.info(f"Image resized to {new_width}x{new_height}")
 
                     image_media_type = attachment.content_type
-                    
+
                     # Convert PIL Image to bytes
                     img_byte_arr = io.BytesIO()
-                    
+
                     # Handle different image modes for JPEG compatibility
                     if image.mode in ('RGBA', 'LA', 'P'):
                         # Convert to RGB for JPEG compatibility
@@ -168,65 +157,92 @@ async def handle_chat_request(interaction: discord.Interaction, newUserMessage: 
                             else:  # LA mode
                                 background.paste(image.convert('RGB'), mask=image.split()[-1])
                             image = background
-                    
+
                     # Save as JPEG (now safe since we've converted problematic modes)
                     image.save(img_byte_arr, format='JPEG', quality=85)
                     img_byte_arr = img_byte_arr.getvalue()
-                    
+
                     # Encode to base64 string
                     image_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
 
-                    conversationToBot.append({"role": "user",
-                                            "content": [
-                                                {
-                                                    "type": "image",
-                                                    "source": {
-                                                        "type": "base64",
-                                                        "media_type": "image/jpeg",
-                                                        "data": image_base64
-                                                    }
-                                                },
-                                                {
-                                                    "type": "text",
-                                                    "text": f"{newUserMessage.content} "
-                                                }                   
-                                            ]})
-                    
+                    user_content = {"role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "image/jpeg",
+                                                "data": image_base64
+                                            }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": f"{newUserMessage.content} "
+                                        }
+                                    ]}
+
         else:
-            conversationToBot.append({"role": "user", "content": newUserMessage.content})
+            user_content = {"role": "user", "content": newUserMessage.content}
 
     except Exception as e:
         logger.error(f"Failed to process image: {e}")
+        user_content = {"role": "user", "content": newUserMessage.content}
 
-                
-                
+    conversation_history.append(user_content)
 
-    reply = await send_to_ai(conversationToBot, interaction)
-
-    return reply
+    await send_to_ai(conversation_history, message_to_edit, user_id)
 
 
-@client.tree.context_menu(name="Ask JD Tracker")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.check(channel_check)
-async def ask_jd(interaction: discord.Interaction, message: discord.Message):
-    logger.info(f"User {interaction.user.name} used Ask JD Tracker")
-    # Defer the response to prevent timeout during processing
-    await interaction.response.defer()
+@client.event
+async def on_message(message: discord.Message):
+    # Ignore messages from the bot itself
+    if message.author == client.user:
+        return
 
-    reply = await handle_chat_request(interaction=interaction, newUserMessage=message, continueConversation=False)
+    # Check if message is in allowed channels or from override users
+    channel_id = str(message.channel.id)
+    user_id_check = message.author.id
     
-    # Send the reply back to Discord
-    await interaction.followup.send(reply)
-
-@ask_jd.error
-async def ask_denbot_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        logger.info(f"User {interaction.user.name} tried to ask JD Tracker but did not have permission.")
-        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+    logger.info(f"Message from user {user_id_check} in channel {channel_id}")
+    logger.debug(f"Allowed channels: {ALLOWED_CHANNELS}")
+    logger.debug(f"Override users: {OVERRIDE_USERS}")
+    
+    # Check if user is in override list (bypasses all channel restrictions)
+    if user_id_check in OVERRIDE_USERS:
+        logger.debug(f"User {user_id_check} is in override list, processing message")
     else:
-        # Handle other errors or re-raise
-        raise error
+        # Check if channel is allowed
+        if channel_id not in ALLOWED_CHANNELS:
+            logger.debug(f"Channel {channel_id} not in allowed channels, ignoring message")
+            return
+        
+        # If channel has user restrictions, check them
+        allowed_users = ALLOWED_CHANNELS[channel_id]
+        if allowed_users is not None and user_id_check not in allowed_users:
+            logger.debug(f"User {user_id_check} not in allowed users {allowed_users} for channel {channel_id}, ignoring message")
+            return
+        
+        logger.info(f"Message from user {user_id_check} in channel {channel_id} passed filtering, processing")
+
+    user_id = message.author.id
+
+    # Determine if this is a reply to the bot's message
+    is_reply_to_bot = False
+    if message.reference and message.reference.resolved:
+        if message.reference.resolved.author == client.user:
+            is_reply_to_bot = True
+
+    # Initialize or reset history
+    if user_id not in user_histories or not is_reply_to_bot:
+        user_histories[user_id] = []
+
+    # Send initial "Bot is thinking" message
+    thinking_message = await message.channel.send("Bot is thinking")
+
+    # Process the message
+    await handle_chat_request(user_histories[user_id], message, thinking_message, user_id)
+
+    # After processing, append the assistant's response to history
+    # This is done in send_to_ai when editing the message
     
 client.run(BOT_API_KEY)

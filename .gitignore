@@ -207,4 +207,4 @@ testing/
 
 conversations.db
 
-health_db.json
+health_db*.json
