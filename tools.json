@@ -42,5 +42,23 @@
             },
             "required": []
         }
+    },
+    {
+        "name": "edit_last_item",
+        "description": "Edit the most recently added health item in the database. You can update the name and/or calories of the last item that was added. Both parameters are optional - provide only the fields you want to update.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The new name for the food item (optional)"
+                },
+                "calories": {
+                    "type": "number",
+                    "description": "The new number of calories for the food item (optional)"
+                }
+            },
+            "required": []
+        }
     }
 ]
