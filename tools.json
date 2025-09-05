@@ -1,7 +1,7 @@
 [
     {
         "name": "append_health",
-        "description": "Add health data (food name and calories) to the health database for today's date. This tool allows you to log food items with their calorie values to track daily nutrition intake. Items are automatically organized by date.",
+        "description": "Add health data (food name and calories) to the health database for a specific date. This tool allows you to log food items with their calorie values to track daily nutrition intake. Items are automatically organized by date. If no date is provided, it defaults to today's date.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -12,6 +12,10 @@
                 "calories": {
                     "type": "number",
                     "description": "The number of calories in the food item"
+                },
+                "date": {
+                    "type": "string",
+                    "description": "The date in YYYY-MM-DD format (optional, defaults to today)"
                 }
             },
             "required": [

@@ -10,8 +10,14 @@ def append_health(input, user_id):
     try:
         db_file = f"health_db_{user_id}.json"
 
-        # Get current date
-        today = datetime.now().strftime("%Y-%m-%d")
+        # Get the date (default to today if not provided)
+        date = input.get("date", datetime.now().strftime("%Y-%m-%d"))
+        
+        # Validate date format
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return "Error: Date must be in YYYY-MM-DD format"
 
         # First, read the existing data
         try:
@@ -21,18 +27,18 @@ def append_health(input, user_id):
             # If file doesn't exist or is empty/invalid, start with empty dict
             db = {}
 
-        # Create today's entry if it doesn't exist
-        if today not in db:
-            db[today] = []
+        # Create the date entry if it doesn't exist
+        if date not in db:
+            db[date] = []
 
-        # Append the new item to today's list
-        db[today].append({"name": input.get("name"), "calories": input.get("calories")})
+        # Append the new item to the specified date's list
+        db[date].append({"name": input.get("name"), "calories": input.get("calories")})
 
         # Write the updated data back to the file
         with open(db_file, "w") as file:
             json.dump(db, file, indent=2)
 
-        return "Successfully added to database"
+        return f"Successfully added to database for {date}"
 
     except Exception as e:
         logger.error(f"Error: {e}")
